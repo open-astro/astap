@@ -18,7 +18,10 @@ uses
 type
   TRowProc = procedure(startRow, endRow: integer; data: pointer);
 
+  TTaskProc = function(idx: integer; data: pointer): boolean; {return true to stop handing out tasks with a higher index}
+
 procedure parallel_rows(nrows: integer; proc: TRowProc; data: pointer); {run proc over [0..nrows-1] split in chunks on all threads; returns when all chunks are done}
+procedure parallel_tasks(ntasks: integer; proc: TTaskProc; data: pointer); {run proc(0..ntasks-1) on all threads in index order; a task returning true stops tasks with a higher index. Returns when all started tasks are done}
 function cli_thread_count: integer;
 
 implementation
@@ -119,6 +122,44 @@ begin
     RTLEventWaitFor(workers[i].done);
     RTLEventResetEvent(workers[i].done);
   end;
+end;
+
+type
+  Ttaskshared = record
+    next, stop_at : longint;
+    ntasks        : integer;
+    proc          : TTaskProc;
+    data          : pointer;
+  end;
+  Ptaskshared = ^Ttaskshared;
+
+procedure task_loop(startRow, endRow: integer; data: pointer);
+var
+  sh       : Ptaskshared;
+  idx, old : longint;
+begin
+  sh:=Ptaskshared(data);
+  repeat
+    idx:=InterlockedIncrement(sh^.next)-1;
+    if ((idx>=sh^.ntasks) or (idx>=sh^.stop_at)) then break;
+    if sh^.proc(idx, sh^.data) then
+      repeat {lower stop_at to idx unless somebody stopped earlier}
+        old:=sh^.stop_at;
+        if idx>=old then break;
+      until InterlockedCompareExchange(sh^.stop_at, idx, old)=old;
+  until false;
+end;
+
+procedure parallel_tasks(ntasks: integer; proc: TTaskProc; data: pointer);
+var
+  sh : Ttaskshared;
+begin
+  sh.next:=0;
+  sh.stop_at:=high(longint);
+  sh.ntasks:=ntasks;
+  sh.proc:=proc;
+  sh.data:=data;
+  parallel_rows(cli_thread_count*16, @task_loop, @sh); {one task_loop per thread}
 end;
 
 end.
