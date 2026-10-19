@@ -763,8 +763,9 @@ end;
 
 
 type
-  Tconvert16 = record {parameters for the parallel 16 bit FITS conversion}
-    plane  : pword;         {big endian 16 bit pixels, width*height}
+  Tconvert16 = record {parameters for the parallel 16 bit FITS read and conversion}
+    filen  : string;        {FITS file, each worker opens its own handle}
+    offset : int64;         {file offset of the first pixel of this colour plane}
     img    : Timage_array;
     k      : integer;
     width  : integer;
@@ -775,9 +776,14 @@ type
   Pconvert16 = ^Tconvert16;
 
 procedure convert_rows_16(startRow, endRow: integer; data: pointer);
+{read rows startRow..endRow of a 16 bit big endian plane straight from the file and convert to single. Runs on a worker thread}
+const
+  rows_per_read=64;
 var
   d        : Pconvert16;
-  j, i     : integer;
+  j, i, r, nrows, nread  : integer;
+  f        : TFileStream;
+  buf      : array of word;
   src      : pword;
   dst      : psingle;
   word16   : word;
@@ -787,20 +793,38 @@ begin
   d:=Pconvert16(data);
   bscale:=d^.bscale;
   bzero:=d^.bzero;
-  for j:=startRow to endRow do
-  begin
-    src:=d^.plane;
-    inc(src, j*d^.width); {typed pointer increment is scaled by the element size}
-    dst:=@d^.img[d^.k, j, 0];
-    mx:=0;
-    for i:=0 to d^.width-1 do
+  setlength(buf, rows_per_read*d^.width);
+  try
+    f:=TFileStream.Create(d^.filen, fmOpenRead or fmShareDenyNone);
+  except
+    exit;
+  end;
+  try
+    f.Position:=d^.offset + int64(startRow)*d^.width*2;
+    j:=startRow;
+    while j<=endRow do
     begin
-      word16:=swap(src[i]);{in FITS file hi en low bytes are swapped}
-      col_float:=smallint(word16)*bscale + bzero; {explicit signed cast; an absolute alias on a local breaks under -O3}
-      dst[i]:=col_float;
-      if col_float>mx then mx:=col_float;
+      nrows:=min(rows_per_read, endRow-j+1);
+      nread:=f.Read(buf[0], nrows*d^.width*2);
+      if nread<nrows*d^.width*2 then fillchar(buf[nread div 2], nrows*d^.width*2-nread, 0); {short file, keep going with zeros like the serial reader}
+      for r:=0 to nrows-1 do
+      begin
+        src:=@buf[r*d^.width];
+        dst:=@d^.img[d^.k, j+r, 0];
+        mx:=0;
+        for i:=0 to d^.width-1 do
+        begin
+          word16:=swap(src[i]);{in FITS file hi en low bytes are swapped}
+          col_float:=smallint(word16)*bscale + bzero; {explicit signed cast; an absolute alias on a local breaks under -O3}
+          dst[i]:=col_float;
+          if col_float>mx then mx:=col_float;
+        end;
+        d^.rowmax[j+r]:=mx;
+      end;
+      j:=j+nrows;
     end;
-    d^.rowmax[j]:=mx;
+  finally
+    f.Free;
   end;
 end;
 
@@ -817,7 +841,6 @@ var
   fitsbufferRGB: array[0..trunc(bufwide/3)] of byteX3 absolute fitsbuffer;{buffer for 8 bit RGB FITS file}
   fitsbuffer4: array[0..round(bufwide/4)] of longword absolute fitsbuffer;{buffer for floating bit ( -32) FITS file}
   fitsbuffer8: array[0..trunc(bufwide/8)] of int64 absolute fitsbuffer;{buffer for floating bit ( -64) FITS file}
-  plane16  : array of word;   {whole 16 bit colour plane, converted on all cores}
   rowmax   : array of single; {per row maximum from the parallel conversion}
   cv16     : Tconvert16;
   TheFile  : tfilestream;
@@ -1817,12 +1840,11 @@ begin
     if head.bitpix=16 then
     for k:=0 to head.naxis3-1 do {do all colors}
     begin
-      {Read the whole colour plane in one go and convert the rows on all cores. On a 4 core SBC this is 3-4x faster than the row by row conversion}
-      setlength(plane16, head.width*head.height);
-      try reader.read(plane16[0],head.width*head.height*2);except; end; {read file info}
+      {Each worker reads its own rows straight from the file and converts them. On a 4 core SBC this is about 3x faster than the serial row by row conversion}
       setlength(rowmax, head.height);
       for j:=0 to head.height-1 do rowmax[j]:=0;
-      cv16.plane:=@plane16[0];
+      cv16.filen:=filen;
+      cv16.offset:=int64(reader_position) + int64(k)*head.width*head.height*2;
       cv16.img:=img_loaded2;
       cv16.k:=k;
       cv16.width:=head.width;
@@ -1832,7 +1854,6 @@ begin
       parallel_rows(head.height, @convert_rows_16, @cv16);
       for j:=0 to head.height-1 do
         if rowmax[j]>measured_max then measured_max:=rowmax[j];{find max value for image. For for images with 0..1 scale or for debayer}
-      plane16:=nil;
     end {colors head.naxis3 times}
     else
     if head.bitpix=-32 then

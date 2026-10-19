@@ -1252,74 +1252,156 @@ begin
 end;
 
 
+type
+  Tfsband = record {stars found by one worker band}
+    stars : Tstar_list;
+    n     : integer;
+    hsnr  : double;
+  end;
+  Tfsdata = record {parameters for the parallel star detection}
+    img, img_sa                        : Timage_array;
+    width2, height2, retries           : integer;
+    startX, endX, rowOffset            : integer;
+    level_star, level_cross            : single;
+    hfd_min                            : double;
+    bands                              : array of Tfsband; {indexed by the first row of the band}
+  end;
+  Pfsdata = ^Tfsdata;
+
+procedure find_stars_band(startRow, endRow: integer; data: pointer);
+{Scan rows startRow+rowOffset..endRow+rowOffset for stars. Runs on a worker thread. img_sa marks are shared between bands:
+ a star straddling a band border is skipped by the band that arrives second. In the rare case both bands measure it before
+ either marks it, collect_bands removes the duplicate.}
+const
+  buffersize=5000;
+var
+  d                                         : Pfsdata;
+  fitsX, fitsY, m, n, i, j, radius, sqr_radius, xci, yci, starpixels, nr : integer;
+  hfd1, star_fwhm, snr, flux, xc, yc, hsnr  : double;
+  rowC, rowM, rowP, rowSA                   : PSingle;
+  b                                         : ^Tfsband;
+begin
+  d:=Pfsdata(data);
+  b:=@d^.bands[startRow];
+  SetLength(b^.stars,3,buffersize);
+  nr:=0;
+  hsnr:=0;
+  for fitsY:=startRow+d^.rowOffset to endRow+d^.rowOffset do
+  begin
+    rowC :=@d^.img[0,fitsY,0];
+    rowM :=@d^.img[0,fitsY-1,0];
+    rowP :=@d^.img[0,fitsY+1,0];
+    rowSA:=@d^.img_sa[0,fitsY,0];
+    for fitsX:=d^.startX to d^.endX do
+    begin
+      if ((rowSA[fitsX]<>d^.retries){star free area for this retry} and (rowC[fitsX]>d^.level_star){star}) then {new star above noise level}
+      begin
+        starpixels:=0;
+        //inspect in a cross around it. Should be above 4*noise level
+        if rowC[fitsX-1]>d^.level_cross then inc(starpixels);
+        if rowC[fitsX+1]>d^.level_cross then inc(starpixels);
+        if rowM[fitsX]  >d^.level_cross then inc(starpixels);
+        if rowP[fitsX]  >d^.level_cross then inc(starpixels);
+        if starpixels>=2 then //At least 3 illuminated pixels. Not a hot pixel
+        begin
+          HFD(d^.img,fitsX,fitsY,14{annulus radius}, hfd1,star_fwhm,snr,flux,xc,yc);{star HFD and FWHM}
+          if ((hfd1<=30) and (snr>10) and (hfd1>d^.hfd_min) {0.8 is two pixels minimum} and (d^.img_sa[0,round(yc),round(xc)]<>d^.retries)) then
+          begin
+            radius:=round(3.0*hfd1);{for marking star area. A value between 2.5*hfd and 3.5*hfd gives same performance. Note in practice a star PSF has larger wings then predicted by a Gaussian function}
+            sqr_radius:=sqr(radius);
+            xci:=round(xc);{star center as integer}
+            yci:=round(yc);
+            for n:=-radius to +radius do {mark the whole circular star area as occupied to prevent double detection's}
+              for m:=-radius to +radius do
+              begin
+                j:=n+yci;
+                i:=m+xci;
+                if ((j>=0) and (i>=0) and (j<d^.height2) and (i<d^.width2) and (sqr(m)+sqr(n)<=sqr_radius)) then
+                  d^.img_sa[0,j,i]:=d^.retries;//mark as star area. Use retries value, so that img_sa does not requires a clearing!
+              end;
+
+            {store values}
+            inc(nr);
+            if nr>=length(b^.stars[0]) then
+              SetLength(b^.stars,3,nr+buffersize);{adapt array size if required}
+            b^.stars[0,nr-1]:=xc; {store star position}
+            b^.stars[1,nr-1]:=yc;
+            b^.stars[2,nr-1]:=snr;{store SNR}
+            if snr>hsnr then hsnr:=snr;{find to highest snr value}
+          end;
+        end;
+      end;
+    end;
+  end;
+  b^.n:=nr;
+  b^.hsnr:=hsnr;
+end;
+
+procedure collect_bands(var d: Tfsdata; var starlistI: Tstar_list; var nrstars: integer; var highest_snr: double);
+{append the band results to starlistI in band order and drop duplicates (same star measured by two bands)}
+const
+  buffersize=5000;
+var
+  row, i, j, first : integer;
+  dup              : boolean;
+begin
+  for row:=0 to high(d.bands) do
+    if d.bands[row].n>0 then
+    begin
+      first:=nrstars;
+      for i:=0 to d.bands[row].n-1 do
+      begin
+        dup:=false;
+        if row>0 then {a band other than the first could have re-measured a star of the band above it}
+          for j:=0 to first-1 do
+            if ((abs(starlistI[0,j]-d.bands[row].stars[0,i])<2) and (abs(starlistI[1,j]-d.bands[row].stars[1,i])<2)) then
+            begin
+              dup:=true;
+              break;
+            end;
+        if dup then continue;
+        inc(nrstars);
+        if nrstars>=length(starlistI[0]) then
+          SetLength(starlistI,3,nrstars+buffersize);
+        starlistI[0,nrstars-1]:=d.bands[row].stars[0,i];
+        starlistI[1,nrstars-1]:=d.bands[row].stars[1,i];
+        starlistI[2,nrstars-1]:=d.bands[row].stars[2,i];
+      end;
+      if d.bands[row].hsnr>highest_snr then highest_snr:=d.bands[row].hsnr;
+      d.bands[row].stars:=nil;
+      d.bands[row].n:=0;
+    end;
+end;
+
 procedure find_stars(img :Timage_array; hfd_min:double; max_stars :integer;out starlistI: Tstar_list);{find stars and put them in a list}
 var
-   nrstars,radius,i,j,retries,xci,yci,sqr_radius,width2,height2,starpixels,xx,yy,startX,endX,startY,endY,stepsX,stepsY : integer;
-   hfd1,star_fwhm,snr,xc,yc,highest_snr,flux, detection_level,backgr, noise_lev : double;
-   img_sa     : Timage_array;
-   startTick2  : qword;{for timing/speed purposes}
+   nrstars,retries,width2,height2,xx,yy,startX,endX,startY,endY,stepsX,stepsY : integer;
+   highest_snr, detection_level,backgr, noise_lev : double;
+   d          : Tfsdata;
+   startTick2 : qword;{for timing/speed purposes}
 const
     buffersize=5000;{5000}
     rastersteps=12;
 
-          procedure find_stars_routine(startx,endx,starty,endy : integer);
-          var
-             fitsX, fitsY,m,n : integer;
-             level_star, level_cross                : single;  //2026 perf, hoisted absolute thresholds
-             rowC, rowM, rowP, rowSA                : PSingle;  //2026 perf, row pointers. img[0,fitsY,fitsX] needs two pointer dereferences per access on a 3-dimensional dynamic array. Caching the row start pointer per fitsY reduces this to one, which matters in this pixel loop that visits every image pixel up to four times
+          procedure find_stars_routine(startx,endx,starty,endy : integer; parallel: boolean);
           begin
-            level_star :=backgr+detection_level; //2026 perf, precalculate. Saves a subtraction per pixel and an addition/multiplication per candidate test
-            level_cross:=backgr+4*noise_lev;
-            for fitsY:=startY to endY do  //Search through the image. Stay one pixel away from the borders.
+            d.level_star :=backgr+detection_level; //precalculate. Saves a subtraction per pixel and an addition/multiplication per candidate test
+            d.level_cross:=backgr+4*noise_lev;
+            d.retries:=retries;
+            d.startX:=startx;
+            d.endX:=endx;
+            if parallel then
             begin
-              rowC :=@img[0,fitsY,0];    //2026 perf, current row
-              rowM :=@img[0,fitsY-1,0];  //2026 perf, row above
-              rowP :=@img[0,fitsY+1,0];  //2026 perf, row below
-              rowSA:=@img_sa[0,fitsY,0]; //2026 perf, star area marking row
-              for fitsX:=startX to endX  do
-              begin
-                if ((rowSA[fitsX]<>retries){star free area for this retry} and (rowC[fitsX]>level_star){star}) then {new star above noise level}
-                begin
-                  starpixels:=0;
-                  //inspect in a cross around it. Should be above 4*noise level
-                  if rowC[fitsX-1]>level_cross then inc(starpixels);//= if img[0,fitsY,fitsX-1]- backgr>4*noise_level then inc(starpixels);
-                  if rowC[fitsX+1]>level_cross then inc(starpixels);//= if img[0,fitsY,fitsX+1]- backgr>4*noise_level then inc(starpixels);
-                  if rowM[fitsX]  >level_cross then inc(starpixels);//= if img[0,fitsY-1,fitsX]- backgr>4*noise_level then inc(starpixels);
-                  if rowP[fitsX]  >level_cross then inc(starpixels);//= if img[0,fitsY+1,fitsX]- backgr>4*noise_level then inc(starpixels);
-                  if starpixels>=2 then //At least 3 illuminated pixels. Not a hot pixel
-                  begin
-                    HFD(img,fitsX,fitsY,14{annulus radius}, hfd1,star_fwhm,snr,flux,xc,yc);{star HFD and FWHM}
-                    if ((hfd1<=30) and (snr>10) and (hfd1>hfd_min) {0.8 is two pixels minimum} and (img_sa[0,round(yc),round(xc)]<>retries)) then
-                    begin
-                      radius:=round(3.0*hfd1);{for marking star area. A value between 2.5*hfd and 3.5*hfd gives same performance. Note in practice a star PSF has larger wings then predicted by a Gaussian function}
-                      sqr_radius:=sqr(radius);
-                      xci:=round(xc);{star center as integer}
-                      yci:=round(yc);
-                      for n:=-radius to +radius do {mark the whole circular star area as occupied to prevent double detection's}
-                        for m:=-radius to +radius do
-                        begin
-                          j:=n+yci;
-                          i:=m+xci;
-                          if ((j>=0) and (i>=0) and (j<height2) and (i<width2) and (sqr(m)+sqr(n)<=sqr_radius)) then
-                            img_sa[0,j,i]:=retries;//mark as star area. Use retries value, so that img_sa does not requires a clearing!
-                          end;
-
-                      {store values}
-                      inc(nrstars);
-                      if nrstars>=length(starlistI[0]) then
-                        SetLength(starlistI,3,nrstars+buffersize);{adapt array size if required}
-                      starlistI[0,nrstars-1]:=xc; {store star position}
-                      starlistI[1,nrstars-1]:=yc;
-                      starlistI[2,nrstars-1]:=snr;{store SNR}
-
-                      if  snr>highest_snr then highest_snr:=snr;{find to highest snr value}
-                    end;
-                  end;
-                end;
-              end;
+              d.rowOffset:=starty;
+              parallel_rows(endy-starty+1, @find_stars_band, @d); {bands on all cores}
+            end
+            else
+            begin
+              d.rowOffset:=0;
+              find_stars_band(starty, endy, @d); {one section on this thread}
             end;
+            collect_bands(d, starlistI, nrstars, highest_snr);
           end;
-
 
 begin
   width2:=length(img[0,0]);{width}
@@ -1329,7 +1411,12 @@ begin
 
   SetLength(starlistI,3,buffersize);{set array length}
 
-  setlength(img_sa,1,height2,width2);//In case the length is set to a larger length than the current one, the new elements are zeroed out for a dynamic array. See https://www.freepascal.org/docs-html/rtl/system/setlength.html.
+  d.img:=img;
+  setlength(d.img_sa,1,height2,width2);//In case the length is set to a larger length than the current one, the new elements are zeroed out for a dynamic array. See https://www.freepascal.org/docs-html/rtl/system/setlength.html.
+  d.width2:=width2;
+  d.height2:=height2;
+  d.hfd_min:=hfd_min;
+  setlength(d.bands, height2);
 
   backgr:=head.backgr;
   noise_lev:=head.noise_level; //get_background is called in bin_and_find_star. Background is stored in cblack
@@ -1344,7 +1431,7 @@ begin
       if head.star_level >30*noise_lev then
       begin
         detection_level:=head.star_level;
-        find_stars_routine(1,width2-1-1,1,height2-1-1);
+        find_stars_routine(1,width2-1-1,1,height2-1-1,true);
       end
       else
         retries:=3;{skip}
@@ -1354,7 +1441,7 @@ begin
       if head.star_level2>30*noise_lev then
       begin
         detection_level:=head.star_level2;
-        find_stars_routine(1,width2-1-1,1,height2-1-1);
+        find_stars_routine(1,width2-1-1,1,height2-1-1,true);
       end
       else
         retries:=2;{skip}
@@ -1362,7 +1449,7 @@ begin
     if retries=2 then
     begin
       detection_level:=30*noise_lev;
-      find_stars_routine(1,width2-1-1,1,height2-1-1);
+      find_stars_routine(1,width2-1-1,1,height2-1-1,true);
     end;
     if retries=1 then  //last try to find faint stars, divide image in sections and for each section find background and noise level
     begin
@@ -1387,7 +1474,7 @@ begin
 
          SigmaClippedMeanFromHistogram(img,startX,endX,startY,endY,max(65500,trunc(head.backgr*2)), 6,0.1,backgr,noise_lev);//mean and noise of this sub section
          detection_level:= 7*noise_lev;
-         find_stars_routine(startX,endX,startY,endY);
+         find_stars_routine(startX,endX,startY,endY,false);
        end;
     end;
 
@@ -1396,6 +1483,8 @@ begin
     dec(retries);{Try again with lower detection level}
   until ((nrstars>=max_stars) or (retries<=0));{reduce dection level till enough stars are found. Note that faint stars have less positional accuracy}
 
+  d.bands:=nil;
+  d.img_sa:=nil;
 
   SetLength(starlistI,3,nrstars);{set length correct}
 
