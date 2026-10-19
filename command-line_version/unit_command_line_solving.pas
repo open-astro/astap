@@ -107,7 +107,7 @@ Below a brief flowchart of the ASTAP astrometric solving process:
 interface
 
 uses
-  Classes, SysUtils,math, unit_command_line_calc_trans_cubic;
+  Classes, SysUtils,math, unit_command_line_calc_trans_cubic, unit_cli_parallel;
 
 type
   Timage_array = array of array of array of Single;
@@ -116,6 +116,7 @@ type
 
 var
    quad_star_distances1, quad_star_distances2: Tstar_list;
+   dbg_t_read,dbg_t_quads,dbg_t_fit,dbg_t0 : qword; dbg_steps : integer; {timing instrumentation}
    A_XYpositions                          : Tstar_list;
    b_Xrefpositions,b_Yrefpositions        :  array of double;
    nr_references,nr_references2               : integer;
@@ -1728,12 +1729,55 @@ begin
 end;
 
 
+type
+  Tbindata = record {parameters for the parallel bin/mono/crop}
+    img, img2            : Timage_array;
+    binning, nrcolors    : integer;
+    shiftX, shiftY, w    : integer;
+  end;
+  Pbindata = ^Tbindata;
+
+procedure bin_rows(startRow, endRow: integer; data: pointer);
+var
+  d                         : Pbindata;
+  fitsY, fitsX, k, i, j, b  : integer;
+  val, norm                 : single;
+  row, dst                  : psingle;
+begin
+  d:=Pbindata(data);
+  b:=d^.binning;
+  norm:=1/(d^.nrcolors*b*b);
+  for fitsY:=startRow to endRow do
+  begin
+    dst:=@d^.img2[0, fitsY, 0];
+    for fitsX:=0 to d^.w-1 do dst[fitsX]:=0;
+    for k:=0 to d^.nrcolors-1 do {all colors to mono}
+      for i:=0 to b-1 do
+      begin
+        row:=@d^.img[k, d^.shiftY+fitsY*b+i, d^.shiftX];
+        if b=1 then
+          for fitsX:=0 to d^.w-1 do dst[fitsX]:=dst[fitsX]+row[fitsX]
+        else
+        if b=2 then
+          for fitsX:=0 to d^.w-1 do dst[fitsX]:=dst[fitsX]+row[fitsX*2]+row[fitsX*2+1]
+        else
+          for fitsX:=0 to d^.w-1 do
+          begin
+            val:=0;
+            for j:=0 to b-1 do val:=val+row[fitsX*b+j];
+            dst[fitsX]:=dst[fitsX]+val;
+          end;
+      end;
+    for fitsX:=0 to d^.w-1 do dst[fitsX]:=dst[fitsX]*norm;
+  end;
+end;
+
 procedure bin_mono_and_crop(var binning: integer; crop {0..1}:double;img : Timage_array; out img2: Timage_array);// Make mono, bin and crop
 var
-  fitsX,fitsY,k, w,h, shiftX,shiftY,nrcolors,width5,height5,i,j,x,y: integer;
-  val       : single;
+  w,h,width5,height5 : integer;
+  d                  : Tbindata;
 begin
-  nrcolors:=Length(img);
+  d.nrcolors:=Length(img);
   width5:=Length(img[0,0]);{width}
   height5:=Length(img[0]); {height}
 
@@ -1750,100 +1794,13 @@ begin
     exit;
   end;
 
-  shiftX:=round(width5*(1-crop)/2); {crop is 0.9, shift is 0.05*head.width}
-  shiftY:=round(height5*(1-crop)/2); {crop is 0.9, start at 0.05*head.height}
-
-  if binning=1 then
-  begin
-    for fitsY:=0 to h-1 do
-      for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        for k:=0 to nrcolors-1 do {all colors and make mono}
-           val:=val + img[k ,shiftY+fitsY,shiftX+fitsx];
-        img2[0,fitsY,fitsX]:=val/nrcolors;
-      end;
-  end
-  else
-  if binning=2 then
-  begin
-    for fitsY:=0 to h-1 do
-       for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        for k:=0 to nrcolors-1 do {all colors}
-          val:=val+(img[k,shiftY+fitsY*2   ,shiftX+fitsX*2]+
-                    img[k,shiftY+fitsY*2 +1,shiftX+fitsX*2]+
-                    img[k,shiftY+fitsY*2   ,shiftX+fitsX*2+1]+
-                    img[k,shiftY+fitsY*2 +1,shiftX+fitsX*2+1])/4;
-        img2[0,fitsY,fitsX]:=val/nrcolors;
-      end;
-  end
-  else
-  if binning=3 then
-  begin
-    for fitsY:=0 to h-1 do {bin & mono image}
-      for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        for k:=0 to nrcolors-1 do {all colors}
-          val:=val+(img[k,shiftY+fitsY*3   ,shiftX+fitsX*3  ]+
-                    img[k,shiftY+fitsY*3   ,shiftX+fitsX*3+1]+
-                    img[k,shiftY+fitsY*3   ,shiftX+fitsX*3+2]+
-                    img[k,shiftY+fitsY*3 +1,shiftX+fitsX*3  ]+
-                    img[k,shiftY+fitsY*3 +1,shiftX+fitsX*3+1]+
-                    img[k,shiftY+fitsY*3 +1,shiftX+fitsX*3+2]+
-                    img[k,shiftY+fitsY*3 +2,shiftX+fitsX*3  ]+
-                    img[k,shiftY+fitsY*3 +2,shiftX+fitsX*3+1]+
-                    img[k,shiftY+fitsY*3 +2,shiftX+fitsX*3+2])/9;
-        img2[0,fitsY,fitsX]:=val/nrcolors;
-      end;
-  end
-  else
-  if binning=4 then
-  begin
-    for fitsY:=0 to h-1 do //bin & mono image
-      for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        for k:=0 to nrcolors-1 do //all colors to mono. Test shows this loop doesn't introduce much delay for mono images
-          val:=val+(img[k,shiftY+fitsY*4   ,shiftX+fitsX*4  ]+
-                    img[k,shiftY+fitsY*4   ,shiftX+fitsX*4+1]+
-                    img[k,shiftY+fitsY*4   ,shiftX+fitsX*4+2]+
-                    img[k,shiftY+fitsY*4   ,shiftX+fitsX*4+3]+
-                    img[k,shiftY+fitsY*4 +1,shiftX+fitsX*4  ]+
-                    img[k,shiftY+fitsY*4 +1,shiftX+fitsX*4+1]+
-                    img[k,shiftY+fitsY*4 +1,shiftX+fitsX*4+2]+
-                    img[k,shiftY+fitsY*4 +1,shiftX+fitsX*4+3]+
-                    img[k,shiftY+fitsY*4 +2,shiftX+fitsX*4  ]+
-                    img[k,shiftY+fitsY*4 +2,shiftX+fitsX*4+1]+
-                    img[k,shiftY+fitsY*4 +2,shiftX+fitsX*4+2]+
-                    img[k,shiftY+fitsY*4 +2,shiftX+fitsX*4+3]+
-                    img[k,shiftY+fitsY*4 +3,shiftX+fitsX*4  ]+
-                    img[k,shiftY+fitsY*4 +3,shiftX+fitsX*4+1]+
-                    img[k,shiftY+fitsY*4 +3,shiftX+fitsX*4+2]+
-                    img[k,shiftY+fitsY*4 +3,shiftX+fitsX*4+3])/16;
-        img2[0,fitsY,fitsX]:=val/nrcolors; //mono result
-      end;
-
-  end
-  else
-  begin //any bin factor. This routine is at bin 4x4 about twice slower then the above routine
-    for fitsY:=0 to h-1 do
-      for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        x:=shiftX+fitsX*binning;
-        y:=shiftY+fitsY*binning;
-        for k:=0 to nrcolors-1 do {all colors to mono. Test shows this loop doesn't introduce much delay for mono images}
-        begin
-          for i:=0 to binning-1 do
-          for j:=0 to binning-1 do
-             val:=val + img[k,y+i   ,x+j];
-        end;
-        img2[0,fitsY,fitsX]:=val/(nrcolors*sqr(binning)); //mono result
-      end;
-  end;
+  d.img:=img;
+  d.img2:=img2;
+  d.binning:=binning;
+  d.w:=w;
+  d.shiftX:=round(width5*(1-crop)/2); {crop is 0.9, shift is 0.05*head.width}
+  d.shiftY:=round(height5*(1-crop)/2); {crop is 0.9, start at 0.05*head.height}
+  parallel_rows(h, @bin_rows, @d); {bin on all cores}
 end;
 
 
@@ -1882,11 +1839,13 @@ begin
     if binfactor>1 then memo2_message('Creating grayscale x '+inttostr(binfactor)+' binning image for solving/star alignment.');
     if cropping<>1 then memo2_message('Cropping image x '+floattostrF2(cropping,0,2));
 
+    dbg_t0:=gettickcount64;
     bin_mono_and_crop(binfactor, cropping,img,img_binned); // Make mono, bin and crop
-
+    writeln(stderr,'T  bin ',gettickcount64-dbg_t0,' ms'); dbg_t0:=gettickcount64;
     get_background(0, img_binned, head, True {calc hist}, True {calculate also standard deviation background});{get back ground}
-
+    writeln(stderr,'T  background ',gettickcount64-dbg_t0,' ms'); dbg_t0:=gettickcount64;
     find_stars(img_binned,hfd_min,max_stars, starlist3); {find stars of the image and put them in a list}
+    writeln(stderr,'T  findstars ',gettickcount64-dbg_t0,' ms');
     nrstars:=Length(starlist3[0]);
 
     if height2<960 then
@@ -2255,7 +2214,9 @@ begin
     binning:=report_binning_astrometric(height2*cropping,arcsec_per_px); {select binning on dimensions of cropped image only}
 
     hfd_min:=max(0.8,min_star_size_arcsec/(binning*fov_org*3600/height2) );{to ignore hot pixels which are too small}
-    bin_and_find_stars(img,binning,cropping,hfd_min, max_stars,starlist2, warning_downsample);{bin, measure background, find stars. Do this every repeat since hfd_min is adapted}
+    dbg_t0:=gettickcount64;
+    bin_and_find_stars(img,binning,cropping,hfd_min, max_stars,starlist2, warning_downsample);
+    writeln(stderr,'T bin+findstars ',gettickcount64-dbg_t0,' ms');{bin, measure background, find stars. Do this every repeat since hfd_min is adapted}
     nrstars_image:=Length(starlist2[0]);
 
     {prepare popupnotifier1 text}
@@ -2277,7 +2238,9 @@ begin
 
     if go_ahead then {enough stars, lets find quads}
     begin
-      find_quads(nrstars_image,starlist2,quad_star_distances2);{find star quads for new image. Quads and quad_smallest are binning independend}
+      dbg_t0:=gettickcount64;
+      find_quads(nrstars_image,starlist2,quad_star_distances2);
+      writeln(stderr,'T image quads ',gettickcount64-dbg_t0,' ms');{find star quads for new image. Quads and quad_smallest are binning independend}
       nr_quads:=Length(quad_star_distances2[0]);
       go_ahead:=nr_quads>=3; {enough quads?}
 
@@ -2381,6 +2344,7 @@ begin
 
               nrstars_required2:=round(nrstars_required*oversize2*oversize2); //nr of stars requested request from database
 
+              dbg_t0:=gettickcount64; inc(dbg_steps);
               if read_stars(ra_database,dec_database,search_field*oversize2,nrstars_required2,{out} starlist1)= false then
               begin
                 memo2_message('Error, no star database found at '+database_path+' ! Download and install a star database.');
@@ -2409,7 +2373,9 @@ begin
               end; //keep only stars visible in image
               //mod 2025 ###################################################
 
-              find_quads(nrstars_image,starlist1,quad_star_distances1);{find quads for reference image/database. Filter out too small quads for Earth based telescopes}
+              dbg_t_read:=dbg_t_read+gettickcount64-dbg_t0; dbg_t0:=gettickcount64;
+              find_quads(nrstars_image,starlist1,quad_star_distances1);
+              dbg_t_quads:=dbg_t_quads+gettickcount64-dbg_t0; dbg_t0:=gettickcount64;{find quads for reference image/database. Filter out too small quads for Earth based telescopes}
 
               if solve_show_log then {global variable set in find stars}
                 memo2_message('Search '+ inttostr(count)+', ['+inttostr(spiral_x)+','+inttostr(spiral_y)+'], position: '+ prepare_ra(ra_database,': ')+prepare_dec(dec_database,'d ')+#9+' Down to magn '+ floattostrF2(mag2/10,0,1) +#9+' '+inttostr(length(starlist1[0]))+' database stars' +#9+' '+inttostr(length(quad_star_distances1[0]))+' database quads to compare.');
@@ -2418,7 +2384,8 @@ begin
               // create supplement lines for sky coverage testing and write to log using -log
               // memo2.add(floattostr(ra_database*12/pi)+',,,'+floattostr(dec_database*180/pi)+',,,,'+inttostr(count)+',,-99'); {create hnsky supplement to test sky coverage}
 
-               solution:=find_offset_and_rotation(minimum_quads {>=3},quad_tolerance);{find an solution}
+               solution:=find_offset_and_rotation(minimum_quads {>=3},quad_tolerance);
+               dbg_t_fit:=dbg_t_fit+gettickcount64-dbg_t0;{find an solution}
             end; {within search circle. Otherwise the search is within a kind of square}
           end;{ra in range}
           inc(count);{step further in spiral}
@@ -2581,6 +2548,7 @@ begin
     update_longstr('WARNING =',warning_str);{update or insert long str including single quotes}
   end;
 
+  writeln(stderr,'T steps ',dbg_steps,' dbread ',dbg_t_read,' ms dbquads ',dbg_t_quads,' ms fit ',dbg_t_fit,' ms');
   if database_type=1 then wide_field_stars:=nil; {free wide_field_database}
 end;
 

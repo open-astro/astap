@@ -31,9 +31,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.   }
 
 {$mode objfpc}{$H+}
 uses
-  {$IFDEF UNIX or ANDROID}{$IFDEF UseCThreads}
-  cthreads,
-  {$ENDIF}{$ENDIF}
+  {$IFDEF UNIX}
+  cthreads, {thread manager, required for the parallel image conversion, binning and search}
+  {$ENDIF}
   Classes, SysUtils, CustApp,
   unit_command_line_solving, unit_command_line_general;
 
@@ -132,7 +132,10 @@ begin
 
 
     filename2:=GetOptionValue('f');
-    file_loaded:=load_image; {load file first to give commandline parameters later priority}
+    dbg_t0:=gettickcount64;
+    file_loaded:=load_image;
+    writeln(stderr,'T load ',gettickcount64-dbg_t0,' ms');
+    if file_loaded then writeln(stderr,'DBG px ',img_loaded[0,100,100]:0:0,' ',img_loaded[0,100,101]:0:0,' ',img_loaded[0,100,102]:0:0,' ',img_loaded[0,2000,3000]:0:0,' w=',length(img_loaded[0,0]),' h=',length(img_loaded[0])); {load file first to give commandline parameters later priority}
     if file_loaded=false then errorlevel:=16;{error file loading}
 
     {apply now overriding parameters}
