@@ -23,6 +23,8 @@ type
 procedure parallel_rows(nrows: integer; proc: TRowProc; data: pointer); {run proc over [0..nrows-1] split in chunks on all threads; returns when all chunks are done}
 procedure parallel_tasks(ntasks: integer; proc: TTaskProc; data: pointer); {run proc(0..ntasks-1) on all threads in index order; a task returning true stops tasks with a higher index. Returns when all started tasks are done}
 function cli_thread_count: integer;
+procedure set_thread_count(n: integer); {from the -threads option; 0 = automatic}
+function cli_timing: boolean; {ASTAP_TIMING=1 in the environment prints phase timings to stderr}
 
 implementation
 
@@ -41,6 +43,21 @@ var
   thread_count : integer = 0;
   workers      : array of Tworker;
   pool_ready   : boolean = false;
+  timing_state : integer = -1;
+
+procedure set_thread_count(n: integer);
+begin
+  if pool_ready then exit; {pool already running}
+  if n<=0 then thread_count:=0 {automatic}
+  else thread_count:=min(16,n);
+end;
+
+function cli_timing: boolean;
+begin
+  if timing_state<0 then
+    if GetEnvironmentVariable('ASTAP_TIMING')='1' then timing_state:=1 else timing_state:=0;
+  result:=(timing_state=1);
+end;
 
 function cli_thread_count: integer;
 var

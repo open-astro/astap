@@ -1959,11 +1959,11 @@ begin
 
     dbg_t0:=gettickcount64;
     bin_mono_and_crop(binfactor, cropping,img,img_binned); // Make mono, bin and crop
-    writeln(stderr,'T  bin ',gettickcount64-dbg_t0,' ms'); dbg_t0:=gettickcount64;
+    if cli_timing then writeln(stderr,'T  bin ',gettickcount64-dbg_t0,' ms'); dbg_t0:=gettickcount64;
     get_background(0, img_binned, head, True {calc hist}, True {calculate also standard deviation background});{get back ground}
-    writeln(stderr,'T  background ',gettickcount64-dbg_t0,' ms'); dbg_t0:=gettickcount64;
+    if cli_timing then writeln(stderr,'T  background ',gettickcount64-dbg_t0,' ms'); dbg_t0:=gettickcount64;
     find_stars(img_binned,hfd_min,max_stars, starlist3); {find stars of the image and put them in a list}
-    writeln(stderr,'T  findstars ',gettickcount64-dbg_t0,' ms');
+    if cli_timing then writeln(stderr,'T  findstars ',gettickcount64-dbg_t0,' ms');
     nrstars:=Length(starlist3[0]);
 
     if height2<960 then
@@ -2432,7 +2432,7 @@ begin
     hfd_min:=max(0.8,min_star_size_arcsec/(binning*fov_org*3600/height2) );{to ignore hot pixels which are too small}
     dbg_t0:=gettickcount64;
     bin_and_find_stars(img,binning,cropping,hfd_min, max_stars,starlist2, warning_downsample);
-    writeln(stderr,'T bin+findstars ',gettickcount64-dbg_t0,' ms');{bin, measure background, find stars. Do this every repeat since hfd_min is adapted}
+    if cli_timing then writeln(stderr,'T bin+findstars ',gettickcount64-dbg_t0,' ms');{bin, measure background, find stars. Do this every repeat since hfd_min is adapted}
     nrstars_image:=Length(starlist2[0]);
 
     {prepare popupnotifier1 text}
@@ -2456,7 +2456,7 @@ begin
     begin
       dbg_t0:=gettickcount64;
       find_quads(nrstars_image,starlist2,quad_star_distances2);
-      writeln(stderr,'T image quads ',gettickcount64-dbg_t0,' ms');{find star quads for new image. Quads and quad_smallest are binning independend}
+      if cli_timing then writeln(stderr,'T image quads ',gettickcount64-dbg_t0,' ms');{find star quads for new image. Quads and quad_smallest are binning independend}
       nr_quads:=Length(quad_star_distances2[0]);
       go_ahead:=nr_quads>=3; {enough quads?}
 
@@ -2600,7 +2600,7 @@ begin
             inc(i);
           end;
         end;
-        writeln(stderr,'T search ',gettickcount64-dbg_t0,' ms, ',npos,' positions, pass ',match_nr+1);
+        if cli_timing then writeln(stderr,'T search ',gettickcount64-dbg_t0,' ms, ',npos,' positions, pass ',match_nr+1);
         DoneCriticalSection(ctx.lock);
 
         if ctx.read_error then
