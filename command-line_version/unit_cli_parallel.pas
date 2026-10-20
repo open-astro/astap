@@ -13,7 +13,7 @@ unit unit_cli_parallel;
 {$mode objfpc}{$H+}
 interface
 uses
-  Classes, SysUtils, math;
+  Classes, SysUtils, math{$IFDEF UNIX}, ctypes{$ENDIF};
 
 type
   TRowProc = procedure(startRow, endRow: integer; data: pointer);
@@ -59,6 +59,28 @@ begin
   result:=(timing_state=1);
 end;
 
+{$IFDEF UNIX}
+function sysconf(name: longint): clong; cdecl; external 'c' name 'sysconf';
+{$ENDIF}
+
+function online_cpu_count: integer;
+{TThread.ProcessorCount returns 1 on FPC 3.2 Linux, so ask libc for the online core count}
+{$IFDEF UNIX}
+var
+  n : clong;
+{$ENDIF}
+begin
+  result:=TThread.ProcessorCount;
+  {$IFDEF UNIX}
+  {$IFDEF DARWIN}
+  n:=sysconf(58); {_SC_NPROCESSORS_ONLN on macOS}
+  {$ELSE}
+  n:=sysconf(84); {_SC_NPROCESSORS_ONLN on Linux}
+  {$ENDIF}
+  if n>0 then result:=n;
+  {$ENDIF}
+end;
+
 function cli_thread_count: integer;
 var
   s : string;
@@ -66,7 +88,7 @@ var
 begin
   if thread_count=0 then
   begin
-    thread_count:=TThread.ProcessorCount;
+    thread_count:=online_cpu_count;
     s:=GetEnvironmentVariable('ASTAP_THREADS');
     if s<>'' then
     begin
