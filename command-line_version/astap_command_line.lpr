@@ -35,7 +35,7 @@ uses
   cthreads, {thread manager for the multi-threaded spiral search. Must be the first unit. It links the program to the C library. Define NoCThreads for a static single thread build}
   {$ENDIF}
   Classes, SysUtils, CustApp,
-  unit_command_line_solving, unit_command_line_general;
+  unit_command_line_solving, unit_command_line_general, unit_cli_parallel;
 
 type
 
@@ -106,7 +106,7 @@ begin
     '-log  {Write the solver log to a .log text file.}'+#10+
     '-update  {Add the solution to the input fits file header. Jpeg, png, tiff will be written as fits}' +#10+
     '-progress   {Log all progress steps and messages}'+#10+
-    '-threads n  {Maximum number of threads for the search. Default is the number of physical processor cores, also set by environment variable ASTAP_THREADS}'+#10+
+    '-threads n  {Maximum number of threads for loading, star detection and the search. Default is the number of physical processor cores, also set by environment variable ASTAP_THREADS}'+#10+
     #10+
     'Analyse options:' +#10+
     '-analyse snr_min {Analyse only and report median HFD and number of stars used}'+#10+
@@ -130,6 +130,7 @@ begin
     commandline_log:=hasoption('log');{log to file. In debug mode enable logging to memo2}
     solve_show_log:=hasoption('progress');{log all progress}
     if hasoption('threads') then max_solve_threads:=strtointdef(GetOptionValue('threads'),0);{maximum number of threads for the search}
+    set_thread_count(max_solve_threads);{OpenAstro: the same number of threads for loading, binning and star detection, see unit_cli_parallel}
     if commandline_log then memo2_message(cmdline);{write the original commmand line}
 
 

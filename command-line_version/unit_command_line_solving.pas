@@ -107,7 +107,7 @@ Below a brief flowchart of the ASTAP astrometric solving process:
 interface
 
 uses
-  Classes, SysUtils,math, unit_command_line_calc_trans_cubic, unit_command_line_general;
+  Classes, SysUtils,math, unit_command_line_calc_trans_cubic, unit_command_line_general, unit_cli_parallel;
 
 type
   Timage_array = array of array of array of Single;
@@ -1370,103 +1370,308 @@ begin
 end;
 
 
+type
+  Tfscand = record {a star candidate measured by a band}
+    xc, yc, snr : double;
+    sx, sy      : integer; {seed pixel where the scan found it}
+    radius      : integer; {round(3*hfd), the star area to mark}
+    marked      : boolean; {the band marked the star area in its private mask}
+  end;
+  Tfsband = record {candidates found by one worker band}
+    cands       : array of Tfscand;
+    n           : integer;
+    first, last : integer; {image rows scanned by this band}
+  end;
+  Tfsdata = record {parameters for the parallel star detection}
+    img, img_sa                        : Timage_array;
+    width2, height2, retries           : integer;
+    startX, endX, rowOffset            : integer;
+    level_star, level_star2            : single; {star pixel level and the level of the pixels around it}
+    hfd_min, snr_minimum               : double;
+    nrows                              : integer; {rows of the section being scanned, from rowOffset}
+    bands                              : array of Tfsband; {indexed by the first row of the band relative to rowOffset. The bands of one scan are contiguous}
+  end;
+  Pfsdata = ^Tfsdata;
+
+{The single core find_stars scans the image top to bottom and marks the area of each accepted star in img_sa, so
+ pixels of that star are not measured again. That makes every decision depend on the stars found above it.
+ To use all cores and still get exactly the single core star list, the work is split in two phases:
+   A. find_stars_band (parallel): each band scans its rows. It reads the shared img_sa (marks of earlier retries and
+      sections) but writes its marks only to a private mask. Every candidate passing the HFD/SNR tests is stored
+      with its seed pixel, also those rejected only because the private mask covered the centroid.
+   B. collect_bands (serial, bands in row order): replays the candidates in scan order against the shared img_sa and
+      applies the single core rules. A candidate rejected here that had marked its area in phase A may have hidden
+      pixels the single core scan would have tested, so those pixels (its area after the seed, not covered by the
+      shared marks) are re-tested in scan order. This happens only for stars straddling a band border and costs a few
+      pixel tests, so the result is bit identical to the serial scan while nearly all HFD work runs in parallel.}
+
+function in_star_area(m, n, sqr_radius: integer): boolean; inline;
+{offset (m,n) from a star centre lies in its marked circular area. The shared marks (accept_star), the band's private
+ marks (find_stars_band) and the re-test of hidden pixels (add_uncovered) must cover exactly the same pixels}
+begin
+  result:=(sqr(m)+sqr(n)<=sqr_radius);
+end;
+
+function star_candidate(const d: Tfsdata; rowC, rowM, rowP: PSingle; fitsX, fitsY: integer; out hfd1, snr, xc, yc: double): boolean;
+{The star test of the serial find_stars for a pixel above level_star: at least three of the eight neighbours in the 3x3
+ around it above level_star2 (not a hot pixel), then the HFD, SNR and minimum HFD limits. The band scan and the replay
+ both use this, so the acceptance criteria live in one place and can not drift apart. rowC, rowM, rowP: image rows
+ fitsY, fitsY-1, fitsY+1}
+var
+  starpixels      : integer;
+  star_fwhm, flux : double;
+begin
+  result:=false;
+  hfd1:=0; snr:=0; xc:=0; yc:=0;
+  starpixels:=0;
+  if rowC[fitsX-1]>d.level_star2 then inc(starpixels);
+  if rowC[fitsX+1]>d.level_star2 then inc(starpixels);
+  if rowM[fitsX]  >d.level_star2 then inc(starpixels);
+  if rowM[fitsX-1]>d.level_star2 then inc(starpixels);
+  if rowM[fitsX+1]>d.level_star2 then inc(starpixels);
+  if rowP[fitsX]  >d.level_star2 then inc(starpixels);
+  if rowP[fitsX-1]>d.level_star2 then inc(starpixels);
+  if rowP[fitsX+1]>d.level_star2 then inc(starpixels);
+  if starpixels<3 then exit; {at least 1+3 illuminated pixels, not a hot pixel}
+  HFD(d.img,fitsX,fitsY,14{annulus radius}, hfd1,star_fwhm,snr,flux,xc,yc);{star HFD and FWHM}
+  result:=((hfd1<=30) and (snr>d.snr_minimum) and (hfd1>d.hfd_min) {0.8 is two pixels minimum});
+end;
+
+procedure find_stars_band(startRow, endRow: integer; data: pointer);
+{Phase A. Scan rows startRow+rowOffset..endRow+rowOffset for star candidates. Runs on a worker thread}
+const
+  buffersize=5000;
+var
+  d                                         : Pfsdata;
+  fitsX, fitsY, m, n, i, j, radius, sqr_radius, xci, yci, nr, nrows, row0, mw, col0 : integer;
+  hfd1, snr, xc, yc                         : double;
+  rowC, rowM, rowP, rowSA                   : PSingle;
+  rowPM                                     : PByte;
+  b                                         : ^Tfsband;
+  pmask                                     : array of byte; {private marks of this band, rows row0..row0+nrows-1, columns col0..col0+mw-1}
+begin
+  d:=Pfsdata(data);
+  b:=@d^.bands[startRow];
+  SetLength(b^.cands,256); {grows on demand. Most of the 13x13 sections of the last retry find only a few stars}
+  nr:=0;
+  row0:=startRow+d^.rowOffset;
+  nrows:=endRow-startRow+1;
+  b^.first:=row0;
+  b^.last:=endRow+d^.rowOffset;
+  col0:=d^.startX;
+  mw:=d^.endX-d^.startX+1;
+  setlength(pmask, nrows*mw); {zeroed. Only the section columns: the last retry scans 13x13 sections and a full width mask per call would cost 13 image sized memsets.
+    Marks outside the section are not kept; a candidate whose centroid lies there is stored as marked and the replay decides, see collect_bands}
+  for fitsY:=row0 to endRow+d^.rowOffset do
+  begin
+    rowC :=@d^.img[0,fitsY,0];
+    rowM :=@d^.img[0,fitsY-1,0];
+    rowP :=@d^.img[0,fitsY+1,0];
+    rowSA:=@d^.img_sa[0,fitsY,0];
+    rowPM:=@pmask[(fitsY-row0)*mw];
+    for fitsX:=d^.startX to d^.endX do
+    begin
+      if ((rowSA[fitsX]<>d^.retries){star free area for this retry} and (rowPM[fitsX-col0]=0) and (rowC[fitsX]>d^.level_star){star}) then {new star above noise level}
+      begin
+        if star_candidate(d^, rowC, rowM, rowP, fitsX, fitsY, hfd1, snr, xc, yc) then
+          begin
+            xci:=round(xc);{star center as integer}
+            yci:=round(yc);
+            if nr>=length(b^.cands) then
+              SetLength(b^.cands,min(2*length(b^.cands), nr+buffersize));{adapt array size if required}
+            b^.cands[nr].xc:=xc;
+            b^.cands[nr].yc:=yc;
+            b^.cands[nr].snr:=snr;
+            b^.cands[nr].sx:=fitsX;
+            b^.cands[nr].sy:=fitsY;
+            radius:=round(3.0*hfd1);{for marking star area. A value between 2.5*hfd and 3.5*hfd gives same performance. Note in practice a star PSF has larger wings then predicted by a Gaussian function}
+            b^.cands[nr].radius:=radius;
+            {the centroid test of the serial code, here against the shared marks and this band's private marks}
+            if d^.img_sa[0,yci,xci]=d^.retries then continue; {centroid in an earlier star's area: the serial scan rejects it, the shared marks only grow, so the replay would too. Not stored}
+            b^.cands[nr].marked:=((yci<row0) or (yci>=row0+nrows) or (xci<col0) or (xci>=col0+mw) or (pmask[(yci-row0)*mw+xci-col0]=0));
+            if b^.cands[nr].marked then
+            begin
+              sqr_radius:=sqr(radius);
+              for n:=-radius to +radius do {mark the whole circular star area as occupied to prevent double detection's}
+              begin
+                j:=n+yci;
+                if ((j<row0) or (j>=row0+nrows)) then continue; {private mask covers only this band}
+                for m:=-radius to +radius do
+                begin
+                  i:=m+xci;
+                  if ((i>=col0) and (i<col0+mw) and in_star_area(m, n, sqr_radius)) then
+                    pmask[(j-row0)*mw+i-col0]:=1;
+                end;
+              end;
+            end;
+            inc(nr);
+          end;
+      end;
+    end;
+  end;
+  b^.n:=nr;
+  if nr=0 then b^.cands:=nil; {collect_bands skips empty bands, release the buffer here}
+end;
+
+procedure collect_bands(var d: Tfsdata; var starlistI: Tstar_list; var nrstars: integer; var highest_snr: double);
+{Phase B. Replay the band candidates in scan order against the shared img_sa with the single core rules, see above}
+const
+  buffersize=5000;
+type
+  Tpix = record y, x: integer; end;
+var
+  band, ci, pend_idx, npend                  : integer;
+  pend                                 : array of Tpix; {pixels to re-test, in scan order}
+  c                                    : ^Tfscand;
+  b                                    : ^Tfsband;
+  rowfirst, rowlast                    : integer; {image rows of the band being replayed}
+
+          procedure accept_star(xc, yc, snr: double; radius: integer);
+          var
+            m, n, i, j, xci, yci, sqr_radius : integer;
+          begin
+            sqr_radius:=sqr(radius);
+            xci:=round(xc);
+            yci:=round(yc);
+            for n:=-radius to +radius do {mark the whole circular star area as occupied to prevent double detection's}
+              for m:=-radius to +radius do
+              begin
+                j:=n+yci;
+                i:=m+xci;
+                if ((j>=0) and (i>=0) and (j<d.height2) and (i<d.width2) and in_star_area(m, n, sqr_radius)) then
+                  d.img_sa[0,j,i]:=d.retries;//mark as star area. Use retries value, so that img_sa does not requires a clearing!
+              end;
+            inc(nrstars);
+            if nrstars>=length(starlistI[0]) then
+              SetLength(starlistI,3,nrstars+buffersize);{adapt array size if required}
+            starlistI[0,nrstars-1]:=xc; {store star position}
+            starlistI[1,nrstars-1]:=yc;
+            starlistI[2,nrstars-1]:=snr;{store SNR}
+            if snr>highest_snr then highest_snr:=snr;{find to highest snr value}
+          end;
+
+          procedure test_pixel(fitsY, fitsX: integer); {the serial inner loop for one pixel}
+          var
+            hfd1, snr, xc, yc : double;
+          begin
+            if ((d.img_sa[0,fitsY,fitsX]<>d.retries) and (d.img[0,fitsY,fitsX]>d.level_star)) then
+              if star_candidate(d, @d.img[0,fitsY,0], @d.img[0,fitsY-1,0], @d.img[0,fitsY+1,0], fitsX, fitsY, hfd1, snr, xc, yc) then
+                if d.img_sa[0,round(yc),round(xc)]<>d.retries then {centroid not in an earlier star's area}
+                  accept_star(xc,yc,snr,round(3.0*hfd1));
+          end;
+
+          procedure add_uncovered(const cd: Tfscand); {queue the pixels of a rejected candidate's private area that the scan still has to see}
+          var
+            m, n, i, j, xci, yci, sqr_radius, k, a, bidx, nnew : integer;
+            batch, pend2 : array of Tpix;
+          begin
+            sqr_radius:=sqr(cd.radius);
+            xci:=round(cd.xc);
+            yci:=round(cd.yc);
+            nnew:=0;
+            setlength(batch, sqr(2*cd.radius+1));
+            for n:=-cd.radius to +cd.radius do
+            begin
+              j:=n+yci;
+              if ((j<rowfirst) or (j>rowlast)) then continue; {the private mask covered only this band}
+              for m:=-cd.radius to +cd.radius do
+              begin
+                i:=m+xci;
+                if ((i<d.startX) or (i>d.endX) or (not in_star_area(m, n, sqr_radius))) then continue;
+                if ((j<cd.sy) or ((j=cd.sy) and (i<=cd.sx))) then continue; {scanned before the candidate was found}
+                if d.img_sa[0,j,i]=d.retries then continue; {also hidden in the serial scan}
+                batch[nnew].y:=j;
+                batch[nnew].x:=i;
+                inc(nnew);
+              end;
+            end;
+            if nnew=0 then exit;
+            {merge the sorted batch with the sorted remainder pend[pend_idx..npend-1]}
+            setlength(pend2, (npend-pend_idx)+nnew);
+            a:=pend_idx; bidx:=0; k:=0;
+            while ((a<npend) or (bidx<nnew)) do
+            begin
+              if ((bidx>=nnew) or ((a<npend) and ((pend[a].y<batch[bidx].y) or ((pend[a].y=batch[bidx].y) and (pend[a].x<batch[bidx].x))))) then
+              begin pend2[k]:=pend[a]; inc(a); end
+              else
+              if ((a<npend) and (pend[a].y=batch[bidx].y) and (pend[a].x=batch[bidx].x)) then
+              begin pend2[k]:=pend[a]; inc(a); inc(bidx); end {already queued by an overlapping rejected candidate, test it once}
+              else
+              begin pend2[k]:=batch[bidx]; inc(bidx); end;
+              inc(k);
+            end;
+            pend:=pend2;
+            pend2:=nil;
+            npend:=k;
+            pend_idx:=0;
+          end;
+
+begin
+  band:=0;
+  while band<d.nrows do {visit only the bands of this scan, they tile rows 0..nrows-1}
+  begin
+    b:=@d.bands[band];
+    band:=b^.last-d.rowOffset+1; {next band}
+    if b^.n>0 then
+    begin
+      rowfirst:=b^.first;
+      rowlast:=b^.last;
+      {replay candidates and queued pixels in scan order}
+      ci:=0;
+      npend:=0; pend_idx:=0;
+      while ((ci<b^.n) or (pend_idx<npend)) do
+      begin
+        if ((pend_idx<npend) and ((ci>=b^.n) or (pend[pend_idx].y<b^.cands[ci].sy) or ((pend[pend_idx].y=b^.cands[ci].sy) and (pend[pend_idx].x<b^.cands[ci].sx)))) then
+        begin
+          test_pixel(pend[pend_idx].y, pend[pend_idx].x);
+          inc(pend_idx);
+        end
+        else
+        begin
+          c:=@b^.cands[ci];
+          if ((d.img_sa[0,c^.sy,c^.sx]<>d.retries) {the serial scan would have tested this pixel} and
+              (d.img_sa[0,round(c^.yc),round(c^.xc)]<>d.retries) {and accepted the centroid}) then
+            accept_star(c^.xc,c^.yc,c^.snr,c^.radius)
+          else
+            if c^.marked then add_uncovered(c^); {the band hid pixels behind this candidate, re-test them}
+          inc(ci);
+        end;
+      end;
+      b^.cands:=nil;
+      b^.n:=0;
+    end;
+  end;
+  pend:=nil;
+end;
+
 procedure find_stars(img :Timage_array; head: theader; hfd_min:double; max_stars :integer;out starlistI: Tstar_list );{find stars and put them in a list}
 var
-   fitsX, fitsY,nrstars,radius,i,j,retries,xci,yci,sqr_radius,width2,height2,starpixels,xx,yy,startX,endX,startY,endY,stepsX,stepsY : integer;
-   hfd1,star_fwhm,snr,xc,yc,highest_snr,flux, detection_level,backgr, noise_level,snr_minimum,detection_level_around: double;
-   img_sa     : Timage_array;
-   startTick2  : qword;{for timing/speed purposes}
-// flip_vertical,flip_horizontal  : boolean;
-// starX,starY :integer;
+   nrstars,retries,width2,height2,xx,yy,startX,endX,startY,endY,stepsX,stepsY : integer;
+   highest_snr, detection_level,detection_level_around,backgr, noise_lev : double;
+   d          : Tfsdata;
+   startTick2 : qword;{for timing/speed purposes}
 const
     buffersize=5000;{5000}
     rastersteps=12;
 
-          procedure find_stars_routine(startx,endx,starty,endy : integer);
-          var
-            fitsX, fitsY,m,n : integer;
-            level_star, level_star2                : single;  //2026 perf, hoisted absolute thresholds
-            rowC, rowM, rowP, rowSA                : PSingle;  //2026 perf, row pointers. img[0,fitsY,fitsX] needs two pointer dereferences per access on a 3-dimensional dynamic array. Caching the row start pointer per fitsY reduces this to one, which matters in this pixel loop that visits every image pixel up to four times
+          procedure find_stars_routine(startx,endx,starty,endy : integer; parallel: boolean);
           begin
-            level_star :=backgr+detection_level; //2026 perf, precalculate. Saves a subtraction per pixel and an addition/multiplication per candidate test
-            level_star2:=backgr+detection_level_around;
-            for fitsY:=startY to endY do  //Search through the image. Stay one pixel away from the borders.
-            begin
-              rowC :=@img[0,fitsY,0];    //2026 perf, current row
-              rowM :=@img[0,fitsY-1,0];  //2026 perf, row above
-              rowP :=@img[0,fitsY+1,0];  //2026 perf, row below
-              rowSA:=@img_sa[0,fitsY,0]; //2026 perf, star area marking row
-              for fitsX:=startX to endX  do
-              begin
-                if ((rowSA[fitsX]<>retries){star free area for this retry} and (rowC[fitsX]>level_star){star}) then {new star above noise level}
-                begin
-                  starpixels:=0;
-                  //inspect in a 3x3 around it. Should be above detection_level_around above background
-                  if rowC[fitsX-1]>level_star2 then inc(starpixels);//= if img[0,fitsY,fitsX-1]- backgr>detection_level_around then inc(starpixels);
-                  if rowC[fitsX+1]>level_star2 then inc(starpixels);//= if img[0,fitsY,fitsX+1]- backgr>detection_level_around then inc(starpixels);
-                  if rowM[fitsX]  >level_star2 then inc(starpixels);//= if img[0,fitsY-1,fitsX]- backgr>detection_level_around then inc(starpixels);
-                  if rowM[fitsX-1]>level_star2 then inc(starpixels);//= if img[0,fitsY-1,fitsX-1]- backgr>detection_level_around then inc(starpixels);
-                  if rowM[fitsX+1]>level_star2 then inc(starpixels);//= if img[0,fitsY-1,fitsX+1]- backgr>detection_level_around then inc(starpixels);
-                  if rowP[fitsX]  >level_star2 then inc(starpixels);//= if img[0,fitsY+1,fitsX]- backgr>detection_level_around then inc(starpixels);
-                  if rowP[fitsX-1]>level_star2 then inc(starpixels);//= if img[0,fitsY+1,fitsX-1]- backgr>detection_level_around then inc(starpixels);
-                  if rowP[fitsX+1]>level_star2 then inc(starpixels);//= if img[0,fitsY+1,fitsX+1]- backgr>detection_level_around then inc(starpixels);
-
-                  if starpixels>=3 then //At least 1+3 illuminated pixels. Not a hot pixel
-                  begin
-                    HFD(img,fitsX,fitsY,14{annulus radius}, hfd1,star_fwhm,snr,flux,xc,yc);{star HFD and FWHM}
-                    if ((hfd1<=30) and (snr>snr_minimum) and (hfd1>hfd_min) {0.8 is two pixels minimum} and (img_sa[0,round(yc),round(xc)]<>retries)) then
-                    begin
-                      {for testing}
-                    //  if flip_vertical=false  then  starY:=round(height2-yc) else starY:=round(yc);
-                    //  if flip_horizontal=true then starX:=round(width2-xc)  else starX:=round(xc);
-                    //  size:=round(5*hfd1);
-                    //  mainform1.image1.Canvas.Rectangle(starX-size,starY-size, starX+size, starY+size);{indicate hfd with rectangle}
-                    //  mainform1.image1.Canvas.textout(starX+size,starY+size,floattostrf(hfd1, ffgeneral, 2,1));{add hfd as text}
-                    //  mainform1.image1.Canvas.textout(starX+size,starY+size,floattostrf(snr, ffgeneral, 2,1));{add hfd as text}
-
-                      radius:=round(3.0*hfd1);{for marking star area. A value between 2.5*hfd and 3.5*hfd gives same performance. Note in practice a star PSF has larger wings then predicted by a Gaussian function}
-                      sqr_radius:=sqr(radius);
-                      xci:=round(xc);{star center as integer}
-                      yci:=round(yc);
-                      for n:=-radius to +radius do {mark the whole circular star area as occupied to prevent double detection's}
-                        for m:=-radius to +radius do
-                        begin
-                          j:=n+yci;
-                          i:=m+xci;
-                          if ((j>=0) and (i>=0) and (j<height2) and (i<width2) and (sqr(m)+sqr(n)<=sqr_radius)) then
-                            img_sa[0,j,i]:=retries;//mark as star area. Use retries value, so that img_sa does not requires a clearing!
-                        end;
-
-                      {store values}
-                      inc(nrstars);
-                      if nrstars>=length(starlistI[0]) then
-                      begin
-                        SetLength(starlistI,3,nrstars+buffersize);{adapt array size if required}
-                       end;
-                      starlistI[0,nrstars-1]:=xc; {store star position}
-                      starlistI[1,nrstars-1]:=yc;
-                      starlistI[2,nrstars-1]:=snr;{store SNR}
-
-                      if  snr>highest_snr then highest_snr:=snr;{find to highest snr value}
-                    end;
-                  end;
-                end;
-              end;
-            end;
+            d.level_star :=backgr+detection_level; //precalculate. Saves a subtraction per pixel and an addition/multiplication per candidate test
+            d.level_star2:=backgr+detection_level_around;
+            d.retries:=retries;
+            if ((endx<startx) or (endy<starty)) then exit; {empty section, possible for images under about 24 pixels. The serial loops ran zero times}
+            d.startX:=startx;
+            d.endX:=endx;
+            d.rowOffset:=starty;
+            d.nrows:=endy-starty+1;
+            if parallel then
+              parallel_rows(d.nrows, @find_stars_band, @d) {bands on all cores}
+            else
+              find_stars_band(0, d.nrows-1, @d); {one section on this thread}
+            collect_bands(d, starlistI, nrstars, highest_snr);
           end;
 
-
 begin
-  {for testing}
-//   mainform1.image1.Canvas.Pen.Mode := pmMerge;
-//   mainform1.image1.Canvas.Pen.width := round(1+hd.height/mainform1.image1.height);{thickness lines}
-//   mainform1.image1.Canvas.brush.Style:=bsClear;
-//   mainform1.image1.Canvas.font.color:=$FF;
-//   mainform1.image1.Canvas.font.size:=10;
-//   mainform1.image1.Canvas.Pen.Color := $FF;
-//   flip_vertical:=mainform1.flip_vertical1.Checked;
-//   flip_horizontal:=mainform1.Flip_horizontal1.Checked;
-
   width2:=length(img[0,0]);{width}
   height2:=length(img[0]);{height}
 
@@ -1474,72 +1679,78 @@ begin
 
   SetLength(starlistI,3,buffersize);{set array length}
 
-  setlength(img_sa,1,height2,width2);//In case the length is set to a larger length than the current one, the new elements are zeroed out for a dynamic array. See https://www.freepascal.org/docs-html/rtl/system/setlength.html.
+  d.img:=img;
+  setlength(d.img_sa,1,height2,width2);//In case the length is set to a larger length than the current one, the new elements are zeroed out for a dynamic array. See https://www.freepascal.org/docs-html/rtl/system/setlength.html.
+  d.width2:=width2;
+  d.height2:=height2;
+  d.hfd_min:=hfd_min;
+  d.snr_minimum:=10;
+  setlength(d.bands, height2);
 
   backgr:=head.backgr;
-  noise_level:=head.noise_level;
-  snr_minimum:=10;
-  retries:=4; {try up to four times to get enough stars from the image. So for retries 4,3,2,1 }
+  noise_lev:=head.noise_level; //get_background is called in bin_and_find_star. Background is stored in cblack
+  retries:=4; {try up to four times to get enough stars from the image}
+
   repeat
     highest_snr:=0;
     nrstars:=0;{set counters at zero}
 
     if retries=4 then
     begin
-      if head.star_level >30*noise_level then
+      if head.star_level >30*noise_lev then
       begin
         detection_level:=head.star_level;
-        detection_level_around:=6*noise_level;
-        find_stars_routine(1,width2-1-1,1,height2-1-1);
+        detection_level_around:=6*noise_lev;
+        find_stars_routine(1,width2-1-1,1,height2-1-1,true);
       end
       else
         retries:=3;{skip}
     end;//stars are dominant
     if retries=3 then
     begin
-      if head.star_level2>30*noise_level then
+      if head.star_level2>30*noise_lev then
       begin
         detection_level:=head.star_level2;
-        detection_level_around:=4*noise_level;
-        find_stars_routine(1,width2-1-1,1,height2-1-1);
+        detection_level_around:=4*noise_lev;
+        find_stars_routine(1,width2-1-1,1,height2-1-1,true);
       end
       else
         retries:=2;{skip}
     end;//stars are dominant
     if retries=2 then
     begin
-      detection_level:=30*noise_level;
-      detection_level_around:=4*noise_level;
-      find_stars_routine(1,width2-1-1,1,height2-1-1);
+      detection_level:=30*noise_lev;
+      detection_level_around:=4*noise_lev;
+      find_stars_routine(1,width2-1-1,1,height2-1-1,true);
     end;
     if retries=1 then  //last try to find faint stars, divide image in sections and for each section find background and noise level
     begin
-      snr_minimum:=7;//reduce from 10 to 7
+       d.snr_minimum:=7;//reduce from 10 to 7
+       if height2<width2 then //calculate steps in x, y
+       begin
+         stepsx:=rastersteps;
+         stepsY:=round(rastersteps*height2/width2);
+       end
+       else
+       begin
+         stepsY:=rastersteps;
+         stepsX:=round(rastersteps*width2/height2);
+       end;
 
-      if height2<width2 then //calculate steps in x, y
-      begin
-        stepsx:=rastersteps;
-        stepsY:=round(rastersteps*height2/width2);
-      end
-      else
-      begin
-        stepsY:=rastersteps;
-        stepsX:=round(rastersteps*width2/height2);
-      end;
-        for yy:=0 to stepsY do //find stars in stepsX x stepsY sections
-      for xx:=0 to stepsX do
-      begin
-        startX:=1+round(width2*xx/(stepsX+1));
-        endX:=min(width2-1-1,round(width2*(xx+1)/(stepsX+1)));
-        startY:=1+round(height2*yy/(stepsY+1));
-        endY:=min(height2-1-1,round(height2*(yy+1)/(stepsY+1)));
+       for yy:=0 to stepsY do //find stars in stepsX x stepsY sections
+       for xx:=0 to stepsX do
+       begin
+         startX:=1+round(width2*xx/(stepsX+1));
+         endX:=min(width2-1-1,round(width2*(xx+1)/(stepsX+1)));
+         startY:=1+round(height2*yy/(stepsY+1));
+         endY:=min(height2-1-1,round(height2*(yy+1)/(stepsY+1)));
 
-        SigmaClippedMeanFromHistogram(img,startX,endX,startY,endY,max(65500,trunc(head.backgr*2)), 6,0.1,backgr,noise_level);//mean and noise of this sub section
-        noise_level:=max(noise_level,0.5); {prevent zero noise}
-        detection_level:= 5.5*noise_level;
-        detection_level_around:=2.2*noise_level;
-        find_stars_routine(startX,endX,startY,endY);
-      end;
+         SigmaClippedMeanFromHistogram(img,startX,endX,startY,endY,max(65500,trunc(head.backgr*2)), 6,0.1,backgr,noise_lev);//mean and noise of this sub section
+         noise_lev:=max(noise_lev,0.5); {prevent zero noise}
+         detection_level:= 5.5*noise_lev;
+         detection_level_around:=2.2*noise_lev;
+         find_stars_routine(startX,endX,startY,endY,false);
+       end;
     end;
 
     if solve_show_log then memo2_message(inttostr(nrstars)+' stars found of the requested '+inttostr(max_stars)+'. Background value is '+inttostr(round(head.backgr))+ '. Detection level used '+inttostr( round(detection_level))
@@ -1547,17 +1758,18 @@ begin
     dec(retries);{Try again with lower detection level}
   until ((nrstars>=max_stars) or (retries<=0));{reduce dection level till enough stars are found. Note that faint stars have less positional accuracy}
 
+  d.bands:=nil;
+  d.img_sa:=nil;
+
   SetLength(starlistI,3,nrstars);{set length correct}
 
   if nrstars>max_stars then {reduce number of stars if too high}
   begin
     if solve_show_log then memo2_message('Selecting the '+ inttostr(max_stars)+' brightest stars only.');
-    get_brightest_stars(max_stars, highest_snr , starlistI); //keep only brightest stars
+    get_brightest_stars(max_stars, highest_snr, starlistI);
   end;
-
-  if solve_show_log then memo2_message('Finding stars done in '+ inttostr(gettickcount64 - startTick2) );
+  if solve_show_log then memo2_message('Finding stars done in '+ inttostr(gettickcount64 - startTick2)+ ' ms');
 end;
-
 
 
 procedure reset_solution_vectors(factor: double); {reset the solution vectors}
@@ -1955,12 +2167,92 @@ begin
 end;
 
 
+type
+  Tbindata = record {parameters for the parallel bin/mono/crop}
+    img, img2            : Timage_array;
+    binning, nrcolors    : integer;
+    shiftX, shiftY, w    : integer;
+  end;
+  Pbindata = ^Tbindata;
+
+procedure bin_rows(startRow, endRow: integer; data: pointer);
+{Rows startRow..endRow of the binned mono image. The single precision sums are done in exactly the order and with the
+ same divisions as the serial bin_mono_and_crop of upstream ASTAP, so the result is bit identical also for pixel values
+ that are not whole numbers (BSCALE<>1, 32 bit float images). A reordered sum or a multiplication by 1/n rounds differently}
+var
+  d                          : Pbindata;
+  fitsY, fitsX, k, i, j, b, x, nc : integer;
+  val                        : single;
+  r0, r1, r2, r3, dst        : psingle;
+  rows                       : array of psingle; {rows[k*b+i]: row i of the bin block in colour k, from the crop start}
+begin
+  d:=Pbindata(data);
+  b:=d^.binning;
+  nc:=d^.nrcolors;
+  setlength(rows, nc*b);
+  for fitsY:=startRow to endRow do
+  begin
+    dst:=@d^.img2[0, fitsY, 0];
+    for k:=0 to nc-1 do
+      for i:=0 to b-1 do
+        rows[k*b+i]:=@d^.img[k, d^.shiftY+fitsY*b+i, d^.shiftX];
+    for fitsX:=0 to d^.w-1 do
+    begin
+      val:=0;
+      x:=fitsX*b;
+      case b of
+        1: begin
+             for k:=0 to nc-1 do val:=val+rows[k][x];
+             dst[fitsX]:=val/nc;
+           end;
+        2: begin {serial order: [y,x] [y+1,x] [y,x+1] [y+1,x+1]}
+             for k:=0 to nc-1 do
+             begin
+               r0:=rows[k*2]; r1:=rows[k*2+1];
+               val:=val+(r0[x]+r1[x]+r0[x+1]+r1[x+1])/4;
+             end;
+             dst[fitsX]:=val/nc;
+           end;
+        3: begin
+             for k:=0 to nc-1 do
+             begin
+               r0:=rows[k*3]; r1:=rows[k*3+1]; r2:=rows[k*3+2];
+               val:=val+(r0[x]+r0[x+1]+r0[x+2]+
+                         r1[x]+r1[x+1]+r1[x+2]+
+                         r2[x]+r2[x+1]+r2[x+2])/9;
+             end;
+             dst[fitsX]:=val/nc;
+           end;
+        4: begin
+             for k:=0 to nc-1 do
+             begin
+               r0:=rows[k*4]; r1:=rows[k*4+1]; r2:=rows[k*4+2]; r3:=rows[k*4+3];
+               val:=val+(r0[x]+r0[x+1]+r0[x+2]+r0[x+3]+
+                         r1[x]+r1[x+1]+r1[x+2]+r1[x+3]+
+                         r2[x]+r2[x+1]+r2[x+2]+r2[x+3]+
+                         r3[x]+r3[x+1]+r3[x+2]+r3[x+3])/16;
+             end;
+             dst[fitsX]:=val/nc;
+           end;
+        else
+          begin {any bin factor}
+            for k:=0 to nc-1 do
+              for i:=0 to b-1 do
+                for j:=0 to b-1 do
+                  val:=val+rows[k*b+i][x+j];
+            dst[fitsX]:=val/(nc*sqr(b));
+          end;
+      end;
+    end;
+  end;
+end;
+
 procedure bin_mono_and_crop(var binning: integer; crop {0..1}:double;img : Timage_array; out img2: Timage_array);// Make mono, bin and crop
 var
-  fitsX,fitsY,k, w,h, shiftX,shiftY,nrcolors,width5,height5,i,j,x,y: integer;
-  val       : single;
+  w,h,width5,height5 : integer;
+  d                  : Tbindata;
 begin
-  nrcolors:=Length(img);
+  d.nrcolors:=Length(img);
   width5:=Length(img[0,0]);{width}
   height5:=Length(img[0]); {height}
 
@@ -1977,100 +2269,13 @@ begin
     exit;
   end;
 
-  shiftX:=round(width5*(1-crop)/2); {crop is 0.9, shift is 0.05*head.width}
-  shiftY:=round(height5*(1-crop)/2); {crop is 0.9, start at 0.05*head.height}
-
-  if binning=1 then
-  begin
-    for fitsY:=0 to h-1 do
-      for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        for k:=0 to nrcolors-1 do {all colors and make mono}
-           val:=val + img[k ,shiftY+fitsY,shiftX+fitsx];
-        img2[0,fitsY,fitsX]:=val/nrcolors;
-      end;
-  end
-  else
-  if binning=2 then
-  begin
-    for fitsY:=0 to h-1 do
-       for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        for k:=0 to nrcolors-1 do {all colors}
-          val:=val+(img[k,shiftY+fitsY*2   ,shiftX+fitsX*2]+
-                    img[k,shiftY+fitsY*2 +1,shiftX+fitsX*2]+
-                    img[k,shiftY+fitsY*2   ,shiftX+fitsX*2+1]+
-                    img[k,shiftY+fitsY*2 +1,shiftX+fitsX*2+1])/4;
-        img2[0,fitsY,fitsX]:=val/nrcolors;
-      end;
-  end
-  else
-  if binning=3 then
-  begin
-    for fitsY:=0 to h-1 do {bin & mono image}
-      for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        for k:=0 to nrcolors-1 do {all colors}
-          val:=val+(img[k,shiftY+fitsY*3   ,shiftX+fitsX*3  ]+
-                    img[k,shiftY+fitsY*3   ,shiftX+fitsX*3+1]+
-                    img[k,shiftY+fitsY*3   ,shiftX+fitsX*3+2]+
-                    img[k,shiftY+fitsY*3 +1,shiftX+fitsX*3  ]+
-                    img[k,shiftY+fitsY*3 +1,shiftX+fitsX*3+1]+
-                    img[k,shiftY+fitsY*3 +1,shiftX+fitsX*3+2]+
-                    img[k,shiftY+fitsY*3 +2,shiftX+fitsX*3  ]+
-                    img[k,shiftY+fitsY*3 +2,shiftX+fitsX*3+1]+
-                    img[k,shiftY+fitsY*3 +2,shiftX+fitsX*3+2])/9;
-        img2[0,fitsY,fitsX]:=val/nrcolors;
-      end;
-  end
-  else
-  if binning=4 then
-  begin
-    for fitsY:=0 to h-1 do //bin & mono image
-      for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        for k:=0 to nrcolors-1 do //all colors to mono. Test shows this loop doesn't introduce much delay for mono images
-          val:=val+(img[k,shiftY+fitsY*4   ,shiftX+fitsX*4  ]+
-                    img[k,shiftY+fitsY*4   ,shiftX+fitsX*4+1]+
-                    img[k,shiftY+fitsY*4   ,shiftX+fitsX*4+2]+
-                    img[k,shiftY+fitsY*4   ,shiftX+fitsX*4+3]+
-                    img[k,shiftY+fitsY*4 +1,shiftX+fitsX*4  ]+
-                    img[k,shiftY+fitsY*4 +1,shiftX+fitsX*4+1]+
-                    img[k,shiftY+fitsY*4 +1,shiftX+fitsX*4+2]+
-                    img[k,shiftY+fitsY*4 +1,shiftX+fitsX*4+3]+
-                    img[k,shiftY+fitsY*4 +2,shiftX+fitsX*4  ]+
-                    img[k,shiftY+fitsY*4 +2,shiftX+fitsX*4+1]+
-                    img[k,shiftY+fitsY*4 +2,shiftX+fitsX*4+2]+
-                    img[k,shiftY+fitsY*4 +2,shiftX+fitsX*4+3]+
-                    img[k,shiftY+fitsY*4 +3,shiftX+fitsX*4  ]+
-                    img[k,shiftY+fitsY*4 +3,shiftX+fitsX*4+1]+
-                    img[k,shiftY+fitsY*4 +3,shiftX+fitsX*4+2]+
-                    img[k,shiftY+fitsY*4 +3,shiftX+fitsX*4+3])/16;
-        img2[0,fitsY,fitsX]:=val/nrcolors; //mono result
-      end;
-
-  end
-  else
-  begin //any bin factor. This routine is at bin 4x4 about twice slower then the above routine
-    for fitsY:=0 to h-1 do
-      for fitsX:=0 to w-1  do
-      begin
-        val:=0;
-        x:=shiftX+fitsX*binning;
-        y:=shiftY+fitsY*binning;
-        for k:=0 to nrcolors-1 do {all colors to mono. Test shows this loop doesn't introduce much delay for mono images}
-        begin
-          for i:=0 to binning-1 do
-          for j:=0 to binning-1 do
-             val:=val + img[k,y+i   ,x+j];
-        end;
-        img2[0,fitsY,fitsX]:=val/(nrcolors*sqr(binning)); //mono result
-      end;
-  end;
+  d.img:=img;
+  d.img2:=img2;
+  d.binning:=binning;
+  d.w:=w;
+  d.shiftX:=round(width5*(1-crop)/2); {crop is 0.9, shift is 0.05*head.width}
+  d.shiftY:=round(height5*(1-crop)/2); {crop is 0.9, start at 0.05*head.height}
+  parallel_rows(h, @bin_rows, @d); {bin on all cores}
 end;
 
 
